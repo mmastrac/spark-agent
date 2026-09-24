@@ -29,7 +29,7 @@ read from mentat-serve (`MENTAT_ROUTER_URL`).
 `status-server.py` serves a model container's stage page and its MCP tools.
 A recipe takes it as a submodule rather than a copy:
 
-    git submodule add git@github.com:mmastrac/spark-agent.git .submodules/spark-agent
+    git submodule add https://github.com/mmastrac/spark-agent.git .submodules/spark-agent
     ln -s .submodules/spark-agent/vllm vllm
 
 and its Dockerfile copies `vllm/status-server.py`. BuildKit follows a symlink
