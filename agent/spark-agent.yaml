@@ -1,0 +1,58 @@
+# The agent runs on every node, including ones with no model on them.
+#
+#   docker compose -f spark-agent.yaml up -d
+#
+# It holds what the model container gave up. Keep the two asymmetric: this one
+# is privileged and serves no model, that one serves a model and is not.
+services:
+  spark-agent:
+    image: ${IMAGE:-spark-agent:v6}
+    container_name: spark-agent
+    restart: unless-stopped
+
+    # mentatd's control port is on 127.0.0.1, and mentat-serve dials the
+    # agent's MCP port on the host's own addresses. Both want the host's
+    # network.
+    network_mode: host
+
+    # Container processes appear in the host's PID namespace, which is what
+    # lets py-spy here reach an engine running in another container. This is
+    # the whole reason the model container can drop CAP_SYS_PTRACE.
+    pid: host
+    # SYS_PTRACE and nothing else. Sharing the host PID namespace does not
+    # widen the capability set on its own, so dropping the default 14 first
+    # takes this from 15 capabilities to 1. Read /proc/self/status to check:
+    # under pid: host, /proc/1 is the host's init rather than this process.
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_PTRACE
+
+    # Read-only throughout: the agent observes and never changes the host.
+    # /proc needs no mount, because pid: host already makes the container's
+    # own /proc the host's. No Docker socket either: it is root-equivalent,
+    # and this endpoint answers a model. The host snapshot timer writes
+    # docker-ps.log for the container inventory instead.
+    volumes:
+      - /sys:/sys:ro
+      - ${LOG_DIR:?set LOG_DIR in .env to the host log directory}:/logs:ro
+
+    environment:
+      - AGENT_LOG_DIR=/logs
+      # nvidia-smi and the driver libraries arrive through the container
+      # runtime rather than the image, so the image stays small and the
+      # versions cannot drift from the host's.
+      - NVIDIA_VISIBLE_DEVICES=all
+      # The router the page reads models from. Its address is also let in
+      # to the MCP port, because it forwards every merged tool call.
+      - MENTAT_ROUTER_URL=${MENTAT_ROUTER_URL:?set MENTAT_ROUTER_URL in .env}
+      # Address prefixes allowed to reach the page and MCP: the node subnets.
+      - ALLOWED_SOURCES=${ALLOWED_SOURCES:?set ALLOWED_SOURCES in .env}
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
