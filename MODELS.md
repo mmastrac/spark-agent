@@ -64,6 +64,7 @@ smoketest/
 - [ ] KV pinned (`--kv-cache-memory` or equivalent), never derived from profiling
 - [ ] Model weights mounted read-only
 - [ ] JIT caches (FlashInfer, TileLang, Triton, torch) on a persistent mount
+- [ ] Except the FlashInfer autotune cache when TP > 1: ephemeral, or ranks desync and deadlock
 - [ ] Restart policy set
 
 ## image/
