@@ -32,6 +32,9 @@ A recipe takes it as a submodule rather than a copy:
     git submodule add https://github.com/mmastrac/spark-agent.git .submodules/spark-agent
     ln -s .submodules/spark-agent/vllm vllm
 
-and its Dockerfile copies `vllm/status-server.py`. [MODELS.md](MODELS.md) is
+and its Dockerfile copies `vllm/status-server.py`. Its knobs are environment
+variables, and an empty one counts as unset. Set `SERVING_WHEN_READY=1` on a
+single-node engine with no self-test, so it reads as serving once the API
+answers. [MODELS.md](MODELS.md) is
 the checklist every recipe is held to. BuildKit follows a symlink
 that stays inside the build context, so the image gets the file itself.

@@ -2,23 +2,29 @@
 """Tiny status page and engine MCP tools for a vLLM container.
 
 Runs on its own port from container start, so there is something to look at
-during the ~25-30 min first-run transcode and the ~9 min model load. It does
-NOT proxy inference traffic -- putting a Python hop in front of vLLM would add
+while the model loads. It does NOT proxy inference traffic -- putting a Python hop in front of vLLM would add
 a failure mode and latency to every request for no benefit.
 
 Stage is read from a file the entrypoint appends to, so the page survives the
 entrypoint being mid-exec.
 
-Every node polls its PEERS and renders the whole cluster, so either box answers
-"is the cluster up?" without having to check the other one by hand. A TP rank
-that never joined is the common failure, and it is only visible by comparing
-the two nodes.
+On a multi-node engine every rank polls its PEERS and renders the whole
+cluster, so any box answers "is the cluster up?" without checking the others by
+hand. A TP rank that never joined is the common failure, and it is only visible
+by comparing the nodes. A single-node engine sets no PEERS.
+
+Every setting is an environment variable, and an empty one counts as unset:
+compose passes knobs through as `${VAR:-}`, so an empty string means "use the
+default", never "the value is empty".
 """
 import glob
 import http.server
+import importlib.metadata
+import importlib.util
 import json
 import os
 import re
+import shutil
 import socket
 import socketserver
 import subprocess
@@ -27,22 +33,28 @@ import time
 import urllib.error
 import urllib.request
 
-STAGE_FILE = os.environ.get("STAGE_FILE", "/tmp/ds4-stage")
-PORT = int(os.environ.get("STATUS_PORT", "8081"))
-VLLM_PORT = int(os.environ.get("PORT", "8001"))
+def _env(name: str, default: str = "") -> str:
+    """The variable's value, or the default when it is unset OR empty."""
+    v = os.environ.get(name, "").strip()
+    return v if v else default
+
+
+SERVICE = _env("SERVICE_NAME", _env("SERVED_NAME", "vllm"))
+STAGE_FILE = _env("STAGE_FILE", f"/tmp/{SERVICE}-stage")
+PORT = int(_env("STATUS_PORT", "8081"))
+# vLLM's own default port. Every recipe sets PORT; a default that named another
+# model's port would scrape that engine on a shared box without any error.
+VLLM_PORT = int(_env("PORT", "8000"))
 START = time.time()
 HOSTNAME = socket.gethostname()
 
-ROLE = os.environ.get("ROLE", "head")
-SERVICE = os.environ.get("SERVICE_NAME", os.environ.get("SERVED_NAME", "ds4-flash"))
+ROLE = _env("ROLE", "head")
 
-# Cluster members to poll, "host:port,host:port". Names resolve through the
-# container's /etc/hosts (compose supplies them via extra_hosts) and point at
-# the ConnectX link, so this keeps working when the DHCP lease moves.
-PEERS = [p.strip() for p in os.environ.get(
-    "PEERS", "spark-head:8081,spark-worker:8081").split(",") if p.strip()]
-PEER_POLL_S = float(os.environ.get("PEER_POLL_S", "4"))
-PEER_TIMEOUT_S = float(os.environ.get("PEER_TIMEOUT_S", "2"))
+# Other ranks to poll, "host:port,host:port", for a multi-node engine. Empty
+# for a single-node one: this node then renders alone.
+PEERS = [p.strip() for p in _env("PEERS").split(",") if p.strip()]
+PEER_POLL_S = float(_env("PEER_POLL_S", "4"))
+PEER_TIMEOUT_S = float(_env("PEER_TIMEOUT_S", "2"))
 
 # The worker holds a TP rank and never serves an API, so it needs its own
 # vocabulary -- otherwise it sits forever on a head-oriented stage and looks
@@ -59,9 +71,7 @@ WORKER_STAGES = [
 # look stuck on a step that had long finished.
 _DEFAULT_STAGES = [
     ("starting", "Container started"),
-    ("cache-metadata", "Extracting drafter + metadata from source weights"),
-    ("transcoding", "Transcoding shards from source weights"),
-    ("waiting-workers", "Waiting for TP workers to join Ray"),
+    ("waiting-workers", "Waiting for TP workers to join"),
     ("loading", "Loading model weights and initializing engine"),
     ("self-test", "Self-test: checking the model answers correctly"),
     ("serving", "Serving"),
@@ -71,7 +81,7 @@ _DEFAULT_STAGES = [
 def _parse_stages(spec: str) -> list[tuple[str, str]]:
     """`key:label` pairs, comma separated, in the order the entrypoint writes
     them. A model with a different boot sequence sets STAGES rather than
-    carrying its own copy of this file."""
+    carrying its own copy of this file. A label cannot contain a comma."""
     out = []
     for part in spec.split(","):
         key, _, label = part.partition(":")
@@ -80,8 +90,13 @@ def _parse_stages(spec: str) -> list[tuple[str, str]]:
     return out
 
 
-STAGES = _parse_stages(os.environ["STAGES"]) if os.environ.get("STAGES") \
-         else _DEFAULT_STAGES
+STAGES = _parse_stages(_env("STAGES")) if _env("STAGES") else _DEFAULT_STAGES
+
+# 1 marks the node serving as soon as the engine answers /v1/models. For an
+# entrypoint that runs no self-test and execs into vLLM, which leaves nothing
+# behind to write "serving". Off by default: a model with a self-test must not
+# be called healthy before it passes.
+SERVING_WHEN_READY = _env("SERVING_WHEN_READY", "0") == "1"
 
 # Terminal failure states. Kept out of STAGES so they never render as a step to
 # be reached -- they replace the current step and turn the page red.
@@ -108,15 +123,15 @@ def read_stage():
 # FLASHINFER_CACHE_DIR -- that name is a module constant, not an env var, so
 # reading it here reported a directory nothing ever wrote to and made a cold
 # cache look permanently warm.
-_FI_BASE = os.environ.get("FLASHINFER_WORKSPACE_BASE", os.path.expanduser("~"))
+_FI_BASE = _env("FLASHINFER_WORKSPACE_BASE", os.path.expanduser("~"))
 FLASHINFER_DIR = os.path.join(_FI_BASE, ".cache", "flashinfer")
 
 CACHE_DIRS = [
     ("flashinfer JIT", FLASHINFER_DIR),
-    ("flashinfer autotune", os.environ.get("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR", "")),
-    ("torch.compile", os.environ.get("VLLM_CACHE_ROOT", "")),
-    ("triton", os.environ.get("TRITON_CACHE_DIR", "")),
-    ("tilelang", os.environ.get("TILELANG_CACHE_DIR", "")),
+    ("flashinfer autotune", _env("VLLM_FLASHINFER_AUTOTUNE_CACHE_DIR")),
+    ("torch.compile", _env("VLLM_CACHE_ROOT")),
+    ("triton", _env("TRITON_CACHE_DIR")),
+    ("tilelang", _env("TILELANG_CACHE_DIR")),
 ]
 _size_cache: dict[str, tuple[float, int, float]] = {}
 _baseline: dict[str, int] = {}
@@ -125,8 +140,8 @@ _baseline: dict[str, int] = {}
 # is a poor progress signal -- a cache can be re-writing entries at the same
 # total size, which reads as "idle" when it is the thing holding up the boot.
 # The newest mtime says which stage is doing work RIGHT NOW.
-ACTIVE_WINDOW_S = float(os.environ.get("CACHE_ACTIVE_WINDOW_S", "25"))
-CACHE_ROOT_PATH = os.environ.get("CACHE_ROOT", "/root/.cache")
+ACTIVE_WINDOW_S = float(_env("CACHE_ACTIVE_WINDOW_S", "25"))
+CACHE_ROOT_PATH = _env("CACHE_ROOT", "/root/.cache")
 
 
 def dir_stat(path: str, ttl: float = 4.0) -> tuple[int, float]:
@@ -186,7 +201,7 @@ def vllm_up():
         return False
 
 
-THROUGHPUT_INTERVAL_S = float(os.environ.get("THROUGHPUT_INTERVAL_S", "60"))
+THROUGHPUT_INTERVAL_S = float(_env("THROUGHPUT_INTERVAL_S", "60"))
 _tp_lock = threading.Lock()
 _tp: list[dict] = []          # newest last, bounded
 _TP_KEEP = 15
@@ -324,7 +339,6 @@ def throughput_loop():
                         ),
                     })
                     del _tp[:-_TP_KEEP]
-                    _latest = _tp[-1]
         if cur:
             prev = cur
         time.sleep(THROUGHPUT_INTERVAL_S)
@@ -340,7 +354,7 @@ def throughput_rows():
 # with every cache flat while three compilers ran at 100% -- the page looked
 # idle when the box was saturated. CPU busy needs two /proc/stat samples, so it
 # lives on a timer rather than being computed per request.
-HOST_SAMPLE_S = float(os.environ.get("HOST_SAMPLE_S", "15"))
+HOST_SAMPLE_S = float(_env("HOST_SAMPLE_S", "15"))
 _host_lock = threading.Lock()
 _host: dict = {}
 
@@ -470,12 +484,15 @@ def host_stats() -> dict:
         return dict(_host)
 
 
-def local_status():
+def local_status(caches: bool = True):
     cur, history = read_stage()
-    if ROLE != "worker" and cur == "loading" and vllm_up():
-        # API is bound but the entrypoint has not declared the self-test passed.
-        # Safety net for a watcher that died: never claim serving on its behalf.
-        cur = "self-test"
+    if ROLE != "worker" and cur in ("starting", "loading") and vllm_up():
+        if SERVING_WHEN_READY:
+            cur = "serving"
+        elif "self-test" in dict(STAGES):
+            # API is bound but the entrypoint has not declared the self-test
+            # passed. Never claim serving on its behalf.
+            cur = "self-test"
     healthy = (cur == "worker-ready") if ROLE == "worker" else (cur == "serving")
     failed = cur in FAILED_STAGES
     return {
@@ -486,7 +503,8 @@ def local_status():
         "serving": ROLE != "worker" and cur == "serving",
         "elapsed_s": int(time.time() - START),
         "history": history,
-        "caches": cache_rows(),
+        # Walks every cache directory, so a health probe does not ask for it.
+        "caches": cache_rows() if caches else [],
         "throughput": throughput_rows()[-1] if throughput_rows() else None,
         "throughput_history": throughput_rows(),
         "load": host_stats(),
@@ -497,18 +515,19 @@ def local_status():
 # --- peer polling -----------------------------------------------------------
 # Polled on a timer into a snapshot rather than fetched while rendering, so a
 # hung or unplugged peer costs a stale row instead of a page that never loads.
-# Peers are asked for /status.json, which is deliberately LOCAL-ONLY -- if it
-# included peer data the two nodes would poll each other forever.
+# Peers are asked for /healthz, which is deliberately LOCAL-ONLY -- if it
+# included peer data the nodes would poll each other forever. It is /status.json
+# without the cache walk.
 _peers_lock = threading.Lock()
 _peers: dict[str, dict] = {p: {"addr": p, "reachable": None} for p in PEERS}
 
 
 def poll_peer(addr: str) -> dict:
     try:
-        req = urllib.request.Request(f"http://{addr}/status.json")
+        req = urllib.request.Request(f"http://{addr}/healthz")
         with urllib.request.urlopen(req, timeout=PEER_TIMEOUT_S) as r:
             data = json.loads(r.read().decode())
-        # /status.json answers 503 until healthy; that is a valid answer, not
+        # /healthz answers 503 until healthy; that is a valid answer, not
         # an error, and urllib only raises on it via HTTPError (handled below).
         data.update({"addr": addr, "reachable": True, "seen": time.time()})
         return data
@@ -548,11 +567,11 @@ def cluster_rows():
             "addr": addr,
             "self": is_self,
             # Two different names, for two different jobs:
-            #   addr  -- how THIS node polls the peer: the spark-* alias on the
-            #            ConnectX link. Private to the pair and not resolvable
-            #            from anywhere else, so it must never be a link target.
-            #   name  -- how a READER reaches the peer: the box's real hostname
-            #            (e.g. gx10-node2), which is what resolves on the LAN.
+            #   addr  -- how THIS node polls the peer, often an address on the
+            #            fabric between the ranks. Not resolvable from anywhere
+            #            else, so it must never be a link target.
+            #   name  -- how a READER reaches the peer: the box's real hostname,
+            #            which is what resolves on the LAN.
             # Falls back to the poll address only when the peer is down and has
             # therefore not told us its hostname.
             "name": p.get("host") or addr.rsplit(":", 1)[0],
@@ -752,46 +771,12 @@ def _t_cache_sizes():
     return json.dumps(cache_rows(), indent=2)
 
 
-# --- log tools -------------------------------------------------------------
-# Only registered when MCP_LOG_DIR exists, so a deployment without the mount
-# does not advertise tools that cannot work. The mount itself is the boundary:
-# whatever is bind-mounted at this path is readable by anyone who can reach
-# :8081, so mount a DEDICATED directory, never /var/log or a host root.
-MCP_LOG_DIR = os.environ.get("MCP_LOG_DIR", "/logs")
-MCP_LOG_MAX_LINES = int(os.environ.get("MCP_LOG_MAX_LINES", "2000"))
-# 16 KB, not 64: this lands directly in a model's context, and a tail that
-# large crowds out the reasoning it is meant to inform.
-MCP_LOG_MAX_BYTES = int(os.environ.get("MCP_LOG_MAX_BYTES", "16384"))
-# When filtering, matches may be sparse, so scan far more lines than are
-# returned. Bounded so a pathological pattern cannot walk a multi-GB file.
-MCP_LOG_SCAN_LINES = int(os.environ.get("MCP_LOG_SCAN_LINES", "20000"))
-
-
-def _log_root() -> str | None:
-    try:
-        r = os.path.realpath(MCP_LOG_DIR)
-        return r if os.path.isdir(r) else None
-    except OSError:
-        return None
-
-
-def _resolve_log(name: str) -> str:
-    """Resolve a caller-supplied name inside the log dir, or raise.
-
-    realpath() first so symlinks that escape the directory are caught too --
-    a prefix check on the raw string would not see them.
-    """
-    root = _log_root()
-    if root is None:
-        raise RuntimeError(f"log directory {MCP_LOG_DIR} is not mounted")
-    if not name or name.startswith("/") or "\x00" in name:
-        raise RuntimeError("file must be a relative name inside the log directory")
-    target = os.path.realpath(os.path.join(root, name))
-    if target != root and not target.startswith(root + os.sep):
-        raise RuntimeError("path escapes the log directory")
-    if not os.path.isfile(target):
-        raise RuntimeError(f"no such log file: {name}")
-    return target
+# The log mount, reported in the host sample's free-space figures. Reading logs
+# belongs to the host agent.
+MCP_LOG_DIR = _env("MCP_LOG_DIR", "/logs")
+# Cap on one tool answer (the metrics tool). 16 KB, not 64: this lands directly
+# in a model's context, and more crowds out the reasoning it is meant to inform.
+MCP_LOG_MAX_BYTES = int(_env("MCP_LOG_MAX_BYTES", "16384"))
 
 
 def _now_header() -> str:
@@ -799,14 +784,6 @@ def _now_header() -> str:
     ut = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return f"[now: {lt} / {ut} on {HOSTNAME}]"
 
-
-def _age(ts: float) -> str:
-    d = max(0, int(time.time() - ts))
-    if d < 90:
-        return f"{d}s ago"
-    if d < 5400:
-        return f"{d // 60}m ago"
-    return f"{d // 3600}h{(d % 3600) // 60}m ago"
 
 def _t_versions():
     """Driver, CUDA, firmware and Python stack versions."""
@@ -830,16 +807,25 @@ def _t_versions():
         if v:
             out[label] = v
     out["kernel"] = _read("/proc/sys/kernel/osrelease")
-    for mod in ("torch", "vllm", "flashinfer", "tilelang", "triton", "ray"):
-        try:
-            m = __import__(mod)
-            out[f"py_{mod}"] = getattr(m, "__version__", "(no __version__)")
-        except Exception as e:
-            out[f"py_{mod}"] = f"(import failed: {type(e).__name__})"
+    # Read from package metadata, never by importing: importing torch and vLLM
+    # here would keep over a gigabyte resident in this process for the rest of
+    # the container's life. `ray` is mentat's shim, distributed as mentatd.
+    for label, dists in (("torch", ["torch"]), ("vllm", ["vllm"]),
+                         ("flashinfer", ["flashinfer-python", "flashinfer"]),
+                         ("tilelang", ["tilelang"]), ("triton", ["triton"]),
+                         ("ray", ["mentatd", "ray"])):
+        for d in dists:
+            try:
+                out[f"py_{label}"] = f"{d} {importlib.metadata.version(d)}"
+                break
+            except importlib.metadata.PackageNotFoundError:
+                continue
+        else:
+            out[f"py_{label}"] = "(not installed)"
     return json.dumps(out, indent=2)
 
 
-RAY_DASHBOARD = os.environ.get("RAY_DASHBOARD", "http://127.0.0.1:8265")
+RAY_DASHBOARD = _env("RAY_DASHBOARD", "http://127.0.0.1:8265")
 
 
 def _t_ray_status():
@@ -880,9 +866,27 @@ def _t_ray_status():
 #   - paths must resolve inside SEARCH_ROOTS (realpath, so symlinks cannot escape)
 #   - arguments are passed as argv, never through a shell
 #   - output is capped so one call cannot flood a context window
-SEARCH_ROOTS = [r.strip() for r in os.environ.get(
-    "SEARCH_ROOTS", "/src/vllm,/root/.cache,/logs,/cache").split(",") if r.strip()]
-SEARCH_MAX_BYTES = int(os.environ.get("SEARCH_MAX_BYTES", "16384"))
+def _default_search_roots() -> str:
+    """vLLM's source wherever this image has it, then the caches and logs.
+
+    A source build keeps it in /src/vllm; a stock image has only the installed
+    package. find_spec locates the package without importing it.
+    """
+    roots = []
+    if os.path.isdir("/src/vllm"):
+        roots.append("/src/vllm")
+    try:
+        spec = importlib.util.find_spec("vllm")
+        if spec and spec.origin:
+            roots.append(os.path.dirname(spec.origin))
+    except (ImportError, ValueError):
+        pass
+    return ",".join(roots + ["/root/.cache", "/logs", "/cache"])
+
+
+SEARCH_ROOTS = [r.strip() for r in _env(
+    "SEARCH_ROOTS", _default_search_roots()).split(",") if r.strip()]
+SEARCH_MAX_BYTES = int(_env("SEARCH_MAX_BYTES", "16384"))
 
 
 def _resolve_under_roots(path: str) -> str:
@@ -966,8 +970,9 @@ MCP_TOOLS = [
      "container. The worker node holds a TP rank and never serves an API, so "
      "'worker-ready' is its healthy state, not an error.", _t_node_status, NO_ARGS),
     ("cluster_status", "Stage and health of every node in the serving cluster, "
-     "polled over the ConnectX link. Use this to answer 'is the cluster up?' -- "
-     "one node serving while the other is not is the common failure.",
+     "polled from each rank's status server. Use this to answer 'is the "
+     "cluster up?' -- one node serving while another is not is the common "
+     "failure. A single-node engine shows only itself.",
      _t_cluster_status, NO_ARGS),
     ("metrics", "The engine's raw Prometheus text, filtered by a regex. "
      "Everything the engine reports is here, including counters the summary "
@@ -983,7 +988,8 @@ MCP_TOOLS = [
      "are live rather than what a config file asks for.", _t_serve_args, NO_ARGS),
     ("throughput", "Recent decode and prefill tokens/sec, running and queued "
      "request counts, and speculative-decoding acceptance rate. Rates are "
-     "deltas between samples, not lifetime averages. Acceptance far below ~85% "
+     "deltas between samples, not lifetime averages. Acceptance is blank "
+     "without speculative decoding; far below the model's usual rate it "
      "suggests mismatched or corrupted weights.", _t_throughput, NO_ARGS),
     ("latency_percentiles", "TTFT, inter-token latency, queue time, prefill and "
      "decode durations as p50/p90/p99 over a window you choose, taken as the "
@@ -1013,8 +1019,8 @@ RAY_TOOL = [
      _t_ray_status, NO_ARGS),
 ]
 
-if os.environ.get("ENABLE_RAY_TOOL", "auto") == "1" or (
-    os.environ.get("ENABLE_RAY_TOOL", "auto") == "auto"
+if _env("ENABLE_RAY_TOOL", "auto") == "1" or (
+    _env("ENABLE_RAY_TOOL", "auto") == "auto"
     and os.path.isdir("/tmp/ray")
 ):
     MCP_TOOLS += RAY_TOOL
@@ -1049,7 +1055,7 @@ MCP_TOOLS += [
     ("search_files", "Search file CONTENTS with ripgrep under an allowed root. "
      "Use this to read how the running vLLM actually behaves -- which env var a "
      "cache honours, what a parser registers as, what a flag defaults to -- "
-     "rather than guessing from the name. The source is at /src/vllm.",
+     f"rather than guessing from the name. Allowed roots: {', '.join(SEARCH_ROOTS)}.",
      _t_search_files, {
          "type": "object",
          "properties": {
@@ -1066,11 +1072,10 @@ MCP_TOOLS += [
      }),
 ]
 
-# Registered only when the mount exists, so a deployment without it does not
-# advertise tools that can only fail.
-if _log_root() is not None:
-    MCP_TOOLS += [
-    ]
+# search_files runs ripgrep, which a stock vLLM image does not ship. Listing it
+# anyway would advertise a tool that can only fail.
+if shutil.which("rg") is None:
+    MCP_TOOLS = [t for t in MCP_TOOLS if t[0] != "search_files"]
 
 MCP_BY_NAME = {n: (d, f, sc) for n, d, f, sc in MCP_TOOLS}
 
@@ -1226,7 +1231,7 @@ def memory_report():
         pass
 
     workers = []
-    stats_dir = os.environ.get("TORCH_MEM_STATS_DIR", "").strip()
+    stats_dir = _env("TORCH_MEM_STATS_DIR")
     if stats_dir:
         for name in sorted(glob.glob(os.path.join(stats_dir, "mem-stats-pid*.json"))):
             try:
@@ -1297,7 +1302,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.rstrip("/") or "/"
-        me = local_status()
 
         # The transport allows a GET for server-pushed events. Nothing here
         # pushes, so decline rather than hold a connection open forever.
@@ -1310,6 +1314,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
         # LOCAL ONLY -- see the note on _peers above. Peers poll this endpoint.
         if path in ("/healthz", "/status.json"):
+            me = local_status(caches=(path == "/status.json"))
             self._json(me, 200 if me["healthy"] else 503)
             return
 
@@ -1317,6 +1322,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._json(memory_report(), 200)
             return
 
+        me = local_status()
         if path == "/cluster.json":
             rows = cluster_rows()
             allup = all(r["healthy"] for r in rows) if rows else False
@@ -1381,7 +1387,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             tp_html = (
                 f'<h2>throughput &middot; {tp_src}</h2><table>'
                 f'<tr><th>time</th><th>decode tok/s</th><th>prefill tok/s</th>'
-                f'<th>running</th><th>queued</th><th>MTP accept</th></tr>'
+                f'<th>running</th><th>queued</th><th>spec accept</th></tr>'
                 f'{hist}</table>'
                 f'<div class=foot style="margin-top:.5rem">'
                 f'sampled every {int(THROUGHPUT_INTERVAL_S)}s &middot; '
@@ -1489,7 +1495,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 <div class=foot>
  {("Holding a TP rank; the API lives on the head node." if ROLE == "worker"
     else "API ready at <a href='/v1/models'>:%d</a>" % VLLM_PORT) if healthy
-  else "First run populates the local cache from the source weights; later runs skip straight to loading."}
+  else "Starting up; each stage above ticks as it completes."}
  <br>refreshes every 5s &middot; <a href="/status.json">status.json</a>
  &middot; <a href="/cluster.json">cluster.json</a>
  &middot; MCP at <code>/mcp</code> ({len(MCP_TOOLS)} read-only tools)
